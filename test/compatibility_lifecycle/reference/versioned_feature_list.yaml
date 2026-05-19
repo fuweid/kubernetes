@@ -1485,6 +1485,12 @@
     lockToDefault: false
     preRelease: Beta
     version: "1.28"
+- name: SeparateCacheDelegateListEtcdChannel
+  versionedSpecs:
+  - default: false
+    lockToDefault: false
+    preRelease: Alpha
+    version: "1.34"
 - name: SeparateCacheWatchRPC
   versionedSpecs:
   - default: true

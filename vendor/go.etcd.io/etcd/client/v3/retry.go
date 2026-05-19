@@ -94,18 +94,32 @@ func isSafeRetryMutableRPC(err error) bool {
 }
 
 type retryKVClient struct {
-	kc pb.KVClient
+	kc     pb.KVClient
+	client *Client
 }
 
 // RetryKVClient implements a KVClient.
 func RetryKVClient(c *Client) pb.KVClient {
 	return &retryKVClient{
-		kc: pb.NewKVClient(c.conn),
+		kc:     pb.NewKVClient(c.conn),
+		client: c,
 	}
 }
 
+func (rkv *retryKVClient) rangeClient(ctx context.Context) (pb.KVClient, error) {
+	conn, err := rkv.client.connectionForContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pb.NewKVClient(conn), nil
+}
+
 func (rkv *retryKVClient) Range(ctx context.Context, in *pb.RangeRequest, opts ...grpc.CallOption) (resp *pb.RangeResponse, err error) {
-	return rkv.kc.Range(ctx, in, append(opts, withRepeatablePolicy())...)
+	kc, err := rkv.rangeClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return kc.Range(ctx, in, append(opts, withRepeatablePolicy())...)
 }
 
 func (rkv *retryKVClient) Put(ctx context.Context, in *pb.PutRequest, opts ...grpc.CallOption) (resp *pb.PutResponse, err error) {

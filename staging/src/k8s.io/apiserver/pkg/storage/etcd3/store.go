@@ -727,6 +727,7 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 	ctx, span := tracing.Start(ctx, fmt.Sprintf("List(recursive=%v) etcd3", opts.Recursive),
 		attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
 		attribute.String("key", key),
+		attribute.String("etcd-channel-key", clientv3.ChannelKeyFromContext(ctx)),
 		attribute.String("resourceVersion", opts.ResourceVersion),
 		attribute.String("resourceVersionMatch", string(opts.ResourceVersionMatch)),
 		attribute.Int("limit", int(opts.Predicate.Limit)),

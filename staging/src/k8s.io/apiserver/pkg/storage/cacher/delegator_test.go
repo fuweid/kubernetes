@@ -22,14 +22,59 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/apis/example"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 )
+
+func TestCacheDelegatorDelegateListEtcdChannel(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		enabled   bool
+		expectKey string
+	}{
+		{
+			name:      "feature disabled",
+			enabled:   false,
+			expectKey: "",
+		},
+		{
+			name:      "feature enabled",
+			enabled:   true,
+			expectKey: storage.DelegateListStorageChannelKey,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SeparateCacheDelegateListEtcdChannel, tc.enabled)
+
+			var gotContext context.Context
+			backingStorage := &dummyStorage{
+				getListFn: func(ctx context.Context, _ string, _ storage.ListOptions, listObj runtime.Object) error {
+					gotContext = ctx
+					podList := listObj.(*example.PodList)
+					podList.ResourceVersion = "100"
+					return nil
+				},
+			}
+			delegator := &CacheDelegator{storage: backingStorage}
+
+			if err := delegator.delegateList(context.Background(), "pods", storage.ListOptions{}, &example.PodList{}); err != nil {
+				t.Fatalf("delegateList failed: %v", err)
+			}
+			if got := clientv3.ChannelKeyFromContext(gotContext); got != tc.expectKey {
+				t.Fatalf("unexpected delegate-list etcd channel key: got %q, want %q", got, tc.expectKey)
+			}
+		})
+	}
+}
 
 func TestConsistencyCheckerDigest(t *testing.T) {
 	newListFunc := func() runtime.Object { return &example.PodList{} }

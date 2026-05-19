@@ -284,6 +284,10 @@ func (t *etcd3ProberMonitor) Monitor(ctx context.Context) (metrics.StorageMetric
 }
 
 var newETCD3Client = func(c storagebackend.TransportConfig) (*kubernetes.Client, error) {
+	return newETCD3ClientWithChannelKeys(c)
+}
+
+func newETCD3ClientWithChannelKeys(c storagebackend.TransportConfig, channelKeys ...string) (*kubernetes.Client, error) {
 	tlsInfo := transport.TLSInfo{
 		CertFile:      c.CertFile,
 		KeyFile:       c.KeyFile,
@@ -350,6 +354,7 @@ var newETCD3Client = func(c storagebackend.TransportConfig) (*kubernetes.Client,
 		Endpoints:            c.ServerList,
 		TLS:                  tlsConfig,
 		Logger:               etcd3ClientLogger,
+		ChannelKeys:          channelKeys,
 	}
 
 	return kubernetes.New(cfg)
@@ -429,7 +434,7 @@ func newETCD3Storage(c storagebackend.ConfigForResource, newFunc, newListFunc fu
 		return nil, nil, err
 	}
 
-	client, err := newETCD3Client(c.Transport)
+	client, err := newETCD3ClientWithChannelKeys(c.Transport, etcdChannelKeysForStorage()...)
 	if err != nil {
 		stopCompactor()
 		return nil, nil, err
@@ -473,6 +478,13 @@ func newETCD3Storage(c storagebackend.ConfigForResource, newFunc, newListFunc fu
 		storage = etcd3.NewStoreWithUnsafeCorruptObjectDeletion(storage, c.GroupResource)
 	}
 	return storage, destroyFunc, nil
+}
+
+func etcdChannelKeysForStorage() []string {
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.SeparateCacheDelegateListEtcdChannel) {
+		return []string{storage.DelegateListStorageChannelKey}
+	}
+	return nil
 }
 
 // startDBSizeMonitorPerEndpoint starts a loop to monitor etcd database size and update the

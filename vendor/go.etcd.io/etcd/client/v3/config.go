@@ -74,6 +74,10 @@ type Config struct {
 	// Without this, Dial returns immediately and connecting the server happens in background.
 	DialOptions []grpc.DialOption
 
+	// ChannelKeys is a list of additional gRPC channels to initialize during
+	// client creation. The reserved empty and "default" keys are not allowed.
+	ChannelKeys []string
+
 	// Context is the default client context; it can be used to cancel grpc dial out and
 	// other operations that do not have an explicit context.
 	Context context.Context

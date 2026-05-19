@@ -165,6 +165,11 @@ const (
 	// if the generated name conflicts with an existing resource name, up to a maximum number of 7 retries.
 	RetryGenerateName featuregate.Feature = "RetryGenerateName"
 
+	// owner: @fuweid89
+	//
+	// Allow delegated watch cache LIST requests to use a dedicated etcd client channel.
+	SeparateCacheDelegateListEtcdChannel featuregate.Feature = "SeparateCacheDelegateListEtcdChannel"
+
 	// owner: @cici37
 	//
 	// Allow watch cache to create a watch on a dedicated RPC.
@@ -392,6 +397,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 		{Version: version.MustParse("1.30"), Default: false, PreRelease: featuregate.Alpha},
 		{Version: version.MustParse("1.31"), Default: true, PreRelease: featuregate.Beta},
 		{Version: version.MustParse("1.32"), Default: true, LockToDefault: true, PreRelease: featuregate.GA},
+	},
+
+	SeparateCacheDelegateListEtcdChannel: {
+		{Version: version.MustParse("1.34"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
 	SeparateCacheWatchRPC: {

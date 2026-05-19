@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/otel/attribute"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -190,7 +191,7 @@ func (c *CacheDelegator) GetList(ctx context.Context, key string, opts storage.L
 		return err
 	}
 	if result.ShouldDelegate {
-		return c.storage.GetList(ctx, key, opts, listObj)
+		return c.delegateList(ctx, key, opts, listObj)
 	}
 
 	listRV, err := c.cacher.versioner.ParseResourceVersion(opts.ResourceVersion)
@@ -202,13 +203,13 @@ func (c *CacheDelegator) GetList(ctx context.Context, key string, opts storage.L
 		if !c.cacher.Ready() && shouldDelegateListOnNotReadyCache(opts) {
 			// If Cacher is not initialized, delegator List requests to storage
 			// as described in https://kep.k8s.io/4568
-			return c.storage.GetList(ctx, key, opts, listObj)
+			return c.delegateList(ctx, key, opts, listObj)
 		}
 	} else {
 		if listRV == 0 && !c.cacher.Ready() {
 			// If Cacher is not yet initialized and we don't require any specific
 			// minimal resource version, simply forward the request to storage.
-			return c.storage.GetList(ctx, key, opts, listObj)
+			return c.delegateList(ctx, key, opts, listObj)
 		}
 	}
 	err = c.cacher.GetList(ctx, key, opts, listObj)
@@ -216,14 +217,14 @@ func (c *CacheDelegator) GetList(ctx context.Context, key string, opts storage.L
 	fallback := "false"
 	if err != nil {
 		if errors.IsResourceExpired(err) && utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
-			return c.storage.GetList(ctx, key, opts, listObj)
+			return c.delegateList(ctx, key, opts, listObj)
 		}
 		if result.ConsistentRead {
 			// IsTooLargeResourceVersion occurs when the requested RV is higher than cache's current RV
 			// and cache hasn't caught up within the timeout period. Fall back to etcd.
 			if storage.IsTooLargeResourceVersion(err) {
 				fallback = "true"
-				err = c.storage.GetList(ctx, key, opts, listObj)
+				err = c.delegateList(ctx, key, opts, listObj)
 			}
 			if err != nil {
 				success = "false"
@@ -236,6 +237,13 @@ func (c *CacheDelegator) GetList(ctx context.Context, key string, opts storage.L
 		metrics.ConsistentReadTotal.WithLabelValues(c.cacher.groupResource.Group, c.cacher.groupResource.Resource, success, fallback).Add(1)
 	}
 	return nil
+}
+
+func (c *CacheDelegator) delegateList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+	if utilfeature.DefaultFeatureGate.Enabled(features.SeparateCacheDelegateListEtcdChannel) {
+		ctx = clientv3.WithChannelKey(ctx, storage.DelegateListStorageChannelKey)
+	}
+	return c.storage.GetList(ctx, key, opts, listObj)
 }
 
 func shouldDelegateListOnNotReadyCache(opts storage.ListOptions) bool {

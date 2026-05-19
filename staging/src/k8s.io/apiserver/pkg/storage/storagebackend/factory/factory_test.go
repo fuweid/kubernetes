@@ -20,20 +20,78 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/kubernetes"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/peer"
+	"k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3/testserver"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 )
 
 type mockKV struct {
 	get func(ctx context.Context) (*clientv3.GetResponse, error)
+}
+
+func TestEtcdChannelKeysForStorage(t *testing.T) {
+	if got := etcdChannelKeysForStorage(); got != nil {
+		t.Fatalf("expected no storage channel keys by default, got %v", got)
+	}
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SeparateCacheDelegateListEtcdChannel, true)
+	got := etcdChannelKeysForStorage()
+	if len(got) != 1 || got[0] != storage.DelegateListStorageChannelKey {
+		t.Fatalf("expected delegate-list storage channel key, got %v", got)
+	}
+}
+
+func TestNewETCD3ClientWithDelegateListChannelCreatesDedicatedConnection(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SeparateCacheDelegateListEtcdChannel, true)
+
+	s := newTrackedFactoryKVServer(t)
+	client, err := newETCD3ClientWithChannelKeys(storagebackend.TransportConfig{
+		ServerList: []string{"http://" + s.addr()},
+	}, etcdChannelKeysForStorage()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	requireFactoryChannelConnections(t, s, 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := client.Client.KV.Get(ctx, "default-key"); err != nil {
+		t.Fatalf("default Get failed: %v", err)
+	}
+	if _, err := client.Client.KV.Get(clientv3.WithChannelKey(ctx, storage.DelegateListStorageChannelKey), "delegate-list-key"); err != nil {
+		t.Fatalf("delegate-list Get failed: %v", err)
+	}
+
+	defaultPeer, ok := s.peerAddr("default")
+	if !ok {
+		t.Fatalf("server %s did not receive default request", s.addr())
+	}
+	delegateListPeer, ok := s.peerAddr("delegate-list")
+	if !ok {
+		t.Fatalf("server %s did not receive delegate-list request", s.addr())
+	}
+	if defaultPeer == delegateListPeer {
+		t.Fatalf("expected default and delegate-list requests to use different connections, got %q", defaultPeer)
+	}
 }
 
 func (mkv mockKV) Put(ctx context.Context, key, val string, opts ...clientv3.OpOption) (*clientv3.PutResponse, error) {
@@ -449,4 +507,105 @@ func TestTimeTravelHealthcheck(t *testing.T) {
 		t.Errorf("healthcheck() called etcd %d times, expected only two calls", c)
 	}
 
+}
+
+func requireFactoryChannelConnections(t *testing.T, s *trackedFactoryKVServer, totalConnections uint64) {
+	t.Helper()
+
+	deadline := time.After(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if accepted := s.accepted(); accepted >= totalConnections {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for at least %d channel connections, got %d", totalConnections, s.accepted())
+		case <-ticker.C:
+		}
+	}
+}
+
+type trackedFactoryKVServer struct {
+	etcdserverpb.UnimplementedKVServer
+
+	listener *trackedFactoryListener
+	server   *grpc.Server
+	donec    chan error
+	mu       sync.Mutex
+	peers    map[string]string
+}
+
+func newTrackedFactoryKVServer(t *testing.T) *trackedFactoryKVServer {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trackedLn := &trackedFactoryListener{Listener: ln}
+
+	s := &trackedFactoryKVServer{
+		listener: trackedLn,
+		server:   grpc.NewServer(),
+		donec:    make(chan error, 1),
+		peers:    make(map[string]string),
+	}
+	healthpb.RegisterHealthServer(s.server, health.NewServer())
+	etcdserverpb.RegisterKVServer(s.server, s)
+	go func() {
+		s.donec <- s.server.Serve(trackedLn)
+	}()
+	t.Cleanup(func() {
+		s.server.Stop()
+		<-s.donec
+	})
+	return s
+}
+
+func (s *trackedFactoryKVServer) Range(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
+	if p, ok := peer.FromContext(ctx); ok {
+		keyPrefix := ""
+		switch key := string(req.Key); {
+		case strings.HasPrefix(key, "default-"):
+			keyPrefix = "default"
+		case strings.HasPrefix(key, "delegate-list-"):
+			keyPrefix = "delegate-list"
+		}
+		if keyPrefix != "" {
+			s.mu.Lock()
+			s.peers[keyPrefix] = p.Addr.String()
+			s.mu.Unlock()
+		}
+	}
+	return &etcdserverpb.RangeResponse{Header: &etcdserverpb.ResponseHeader{Revision: 1}}, nil
+}
+
+func (s *trackedFactoryKVServer) addr() string {
+	return s.listener.Addr().String()
+}
+
+func (s *trackedFactoryKVServer) accepted() uint64 {
+	return s.listener.accepted.Load()
+}
+
+func (s *trackedFactoryKVServer) peerAddr(keyPrefix string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peer, ok := s.peers[keyPrefix]
+	return peer, ok
+}
+
+type trackedFactoryListener struct {
+	net.Listener
+	accepted atomic.Uint64
+}
+
+func (l *trackedFactoryListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return conn, err
 }
