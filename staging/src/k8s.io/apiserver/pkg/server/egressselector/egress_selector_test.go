@@ -17,10 +17,12 @@ limitations under the License.
 package egressselector
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -341,5 +343,93 @@ konnectivity_network_proxy_client_client_connections{status="dialing"} 1
 				t.Errorf("GatherAndCompare error: %v", err)
 			}
 		})
+	}
+}
+
+func TestHTTPConnectProxierReturnsOnContextDeadline(t *testing.T) {
+	clientConn, proxyConn := net.Pipe()
+	defer func() {
+		_ = clientConn.Close()
+		_ = proxyConn.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := (&httpConnectProxier{
+			conn:         clientConn,
+			proxyAddress: "proxy",
+		}).proxy(ctx, "webhook.default.svc:443")
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected CONNECT to fail when proxy does not return 200 OK")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context deadline exceeded, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for HTTP CONNECT proxy to return")
+	}
+}
+
+func TestHTTPConnectProxierReturnsOnContextCancel(t *testing.T) {
+	clientConn, proxyConn := net.Pipe()
+	defer func() {
+		_ = clientConn.Close()
+		_ = proxyConn.Close()
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	requestReadCh := make(chan error, 1)
+	go func() {
+		req, err := http.ReadRequest(bufio.NewReader(proxyConn))
+		if err == nil {
+			_ = req.Body.Close()
+		}
+		requestReadCh <- err
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := (&httpConnectProxier{
+			conn:         clientConn,
+			proxyAddress: "proxy",
+		}).proxy(ctx, "webhook.default.svc:443")
+		errCh <- err
+	}()
+
+	select {
+	case err := <-requestReadCh:
+		if err != nil {
+			t.Fatalf("failed to read CONNECT request: %v", err)
+		}
+
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for CONNECT request")
+	}
+
+	select {
+	case <-errCh:
+		t.Fatal("should be blocked in building tunnel")
+	default:
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for HTTP CONNECT proxy to return")
 	}
 }

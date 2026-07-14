@@ -110,7 +110,10 @@ func lookupServiceName(name string) (EgressType, error) {
 }
 
 func tunnelHTTPConnect(proxyConn net.Conn, proxyAddress, addr string) (net.Conn, error) {
-	fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, "127.0.0.1")
+	if _, err := fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, "127.0.0.1"); err != nil {
+		_ = proxyConn.Close()
+		return nil, fmt.Errorf("writing CONNECT to %s via proxy %s failed: %w", addr, proxyAddress, err)
+	}
 
 	// As described in https://go.dev/issue/74633 a misbehaving proxy server
 	// can cause memory exhaustion in the client. The fix in https://go.dev/cl/698915
@@ -121,12 +124,12 @@ func tunnelHTTPConnect(proxyConn net.Conn, proxyAddress, addr string) (net.Conn,
 
 	res, err := http.ReadResponse(br, nil)
 	if err != nil {
-		proxyConn.Close()
+		_ = proxyConn.Close()
 		return nil, fmt.Errorf("reading HTTP response from CONNECT to %s via proxy %s failed: %v",
 			addr, proxyAddress, err)
 	}
 	if res.StatusCode != 200 {
-		proxyConn.Close()
+		_ = proxyConn.Close()
 		return nil, fmt.Errorf("proxy error from %s while dialing %s, code %d: %v",
 			proxyAddress, addr, res.StatusCode, res.Status)
 	}
@@ -136,7 +139,7 @@ func tunnelHTTPConnect(proxyConn net.Conn, proxyAddress, addr string) (net.Conn,
 	// TLS, and in TLS the client speaks first, so we know there's
 	// no unbuffered data. But we can double-check.
 	if br.Buffered() > 0 {
-		proxyConn.Close()
+		_ = proxyConn.Close()
 		return nil, fmt.Errorf("unexpected %d bytes of buffered data from CONNECT proxy %q",
 			br.Buffered(), proxyAddress)
 	}
@@ -145,6 +148,10 @@ func tunnelHTTPConnect(proxyConn net.Conn, proxyAddress, addr string) (net.Conn,
 
 type proxier interface {
 	// proxy returns a connection to addr.
+	//
+	// The provided Context must be non-nil and is used only while connecting to addr.
+	// If the context expires before the connection is established, an error is returned.
+	// Once successfully connected, expiration of the context will not affect the connection.
 	proxy(ctx context.Context, addr string) (net.Conn, error)
 }
 
@@ -156,7 +163,34 @@ type httpConnectProxier struct {
 }
 
 func (t *httpConnectProxier) proxy(ctx context.Context, addr string) (net.Conn, error) {
-	return tunnelHTTPConnect(t.conn, t.proxyAddress, addr)
+	var (
+		connectDone = make(chan struct{})
+		connectConn net.Conn
+		connectErr  error
+	)
+
+	go func() {
+		connectConn, connectErr = tunnelHTTPConnect(t.conn, t.proxyAddress, addr)
+		close(connectDone)
+	}()
+
+	select {
+	case <-connectDone:
+		return connectConn, connectErr
+
+	case <-ctx.Done():
+		// The CONNECT handshake may have completed concurrently with
+		// cancellation. Prefer the completed result before closing the
+		// connection.
+		select {
+		case <-connectDone:
+			return connectConn, connectErr
+		default:
+		}
+
+		_ = t.conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT to %s: %w", addr, context.Cause(ctx))
+	}
 }
 
 var _ proxier = &grpcProxier{}
@@ -256,6 +290,9 @@ func (d *dialerCreator) createDialer() utilnet.DialFunc {
 		return directDialer
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		ctx, cancel := contextWithRequestDeadline(ctx)
+		defer cancel()
+
 		ctx, span := tracing.Start(ctx, fmt.Sprintf("Proxy via %s protocol over %s", d.options.protocol, d.options.transport), attribute.String("address", addr))
 		defer span.End(500 * time.Millisecond)
 		start := egressmetrics.Metrics.Clock().Now()
@@ -411,4 +448,47 @@ func (cs *EgressSelector) Lookup(networkContext NetworkContext) (utilnet.DialFun
 	}
 
 	return cs.egressToDialer[networkContext.EgressSelectionName], nil
+}
+
+type requestDeadlineKey struct{}
+
+// RequestDeadlineRoundTripperWrapper preserves the request deadline while
+// establishing an egress connection. net/http detaches dialing from request
+// cancellation while retaining context values.
+//
+// The deadline only bounds connection establishment. Once DialContext returns
+// successfully, it does not affect the established connection. If the deadline
+// expires first, the in-flight connection attempt is abandoned instead of
+// being made available for reuse by a later request.
+func RequestDeadlineRoundTripperWrapper(rt http.RoundTripper) http.RoundTripper {
+	return requestDeadlineRoundTripper{rt: rt}
+}
+
+type requestDeadlineRoundTripper struct {
+	rt http.RoundTripper
+}
+
+var _ utilnet.RoundTripperWrapper = requestDeadlineRoundTripper{}
+
+func (rt requestDeadlineRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if deadline, ok := req.Context().Deadline(); ok {
+		req = req.WithContext(context.WithValue(req.Context(), requestDeadlineKey{}, deadline))
+	}
+	return rt.rt.RoundTrip(req)
+}
+
+func (rt requestDeadlineRoundTripper) WrappedRoundTripper() http.RoundTripper {
+	return rt.rt
+}
+
+func contextWithRequestDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {} // no-op
+	}
+
+	deadline, ok := ctx.Value(requestDeadlineKey{}).(time.Time)
+	if !ok {
+		return ctx, func() {} // no-op
+	}
+	return context.WithDeadline(ctx, deadline)
 }
