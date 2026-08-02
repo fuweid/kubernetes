@@ -290,9 +290,6 @@ func (d *dialerCreator) createDialer() utilnet.DialFunc {
 		return directDialer
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		ctx, cancel := contextWithRequestDeadline(ctx)
-		defer cancel()
-
 		ctx, span := tracing.Start(ctx, fmt.Sprintf("Proxy via %s protocol over %s", d.options.protocol, d.options.transport), attribute.String("address", addr))
 		defer span.End(500 * time.Millisecond)
 		start := egressmetrics.Metrics.Clock().Now()
@@ -448,47 +445,4 @@ func (cs *EgressSelector) Lookup(networkContext NetworkContext) (utilnet.DialFun
 	}
 
 	return cs.egressToDialer[networkContext.EgressSelectionName], nil
-}
-
-type requestDeadlineKey struct{}
-
-// RequestDeadlineRoundTripperWrapper preserves the request deadline while
-// establishing an egress connection. net/http detaches dialing from request
-// cancellation while retaining context values.
-//
-// The deadline only bounds connection establishment. Once DialContext returns
-// successfully, it does not affect the established connection. If the deadline
-// expires first, the in-flight connection attempt is abandoned instead of
-// being made available for reuse by a later request.
-func RequestDeadlineRoundTripperWrapper(rt http.RoundTripper) http.RoundTripper {
-	return requestDeadlineRoundTripper{rt: rt}
-}
-
-type requestDeadlineRoundTripper struct {
-	rt http.RoundTripper
-}
-
-var _ utilnet.RoundTripperWrapper = requestDeadlineRoundTripper{}
-
-func (rt requestDeadlineRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if deadline, ok := req.Context().Deadline(); ok {
-		req = req.WithContext(context.WithValue(req.Context(), requestDeadlineKey{}, deadline))
-	}
-	return rt.rt.RoundTrip(req)
-}
-
-func (rt requestDeadlineRoundTripper) WrappedRoundTripper() http.RoundTripper {
-	return rt.rt
-}
-
-func contextWithRequestDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {} // no-op
-	}
-
-	deadline, ok := ctx.Value(requestDeadlineKey{}).(time.Time)
-	if !ok {
-		return ctx, func() {} // no-op
-	}
-	return context.WithDeadline(ctx, deadline)
 }

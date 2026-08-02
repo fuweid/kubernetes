@@ -107,13 +107,16 @@ func allowHTTP2(nextProtos []string) bool {
 	return false
 }
 
-type fakeAuthInfoResolver struct{}
+type fakeAuthInfoResolver struct {
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
+}
 
 func (f *fakeAuthInfoResolver) ClientConfigFor(server string) (*rest.Config, error) {
 	return &rest.Config{
 		TLSClientConfig: rest.TLSClientConfig{
 			ServerName: "example.com",
 		},
+		Dial: f.dial,
 	}, nil
 }
 
@@ -122,7 +125,84 @@ func (f *fakeAuthInfoResolver) ClientConfigForService(serviceName, namespace str
 		TLSClientConfig: rest.TLSClientConfig{
 			ServerName: "example.com",
 		},
+		Dial: f.dial,
 	}, nil
+}
+
+func TestWebhookClientConfigDialTimeout(t *testing.T) {
+	timeoutSeconds := int32(2)
+	timeout := time.Duration(timeoutSeconds) * time.Second
+
+	authInfoResolver := &fakeAuthInfoResolver{
+		dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("expected webhook dial context to have a deadline")
+			}
+			remaining := time.Until(deadline)
+			if remaining > timeout {
+				t.Fatalf("expected webhook dial deadline within %v, got %v", timeout, remaining)
+			}
+			return nil, context.Canceled
+		},
+	}
+
+	cm, err := NewClientManager([]schema.GroupVersion{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.SetAuthenticationInfoResolver(authInfoResolver)
+	cm.SetServiceResolver(NewDefaultServiceResolver())
+
+	cfg, err := cm.hookClientConfig(ClientConfig{
+		URL:            "https://webhook.example.com",
+		TimeoutSeconds: &timeoutSeconds,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Timeout != 0 {
+		t.Fatalf("expected webhook client timeout to remain unset, got %v", cfg.Timeout)
+	}
+	if _, err := cfg.Dial(context.Background(), "tcp", "webhook.example.com:443"); err == nil {
+		t.Fatal("expected delegate dialer to return an error")
+	}
+}
+
+func TestWebhookClientCacheKeyIncludesTimeout(t *testing.T) {
+	cm, err := NewClientManager([]schema.GroupVersion{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.SetAuthenticationInfoResolver(&fakeAuthInfoResolver{})
+	cm.SetServiceResolver(NewDefaultServiceResolver())
+
+	timeout1 := int32(1)
+	config := ClientConfig{
+		URL:            "https://webhook.example.com",
+		TimeoutSeconds: &timeout1,
+	}
+	client1, err := cm.HookClient(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client1Again, err := cm.HookClient(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client1 != client1Again {
+		t.Fatal("expected identical webhook configs to reuse a cached client")
+	}
+
+	timeout2 := int32(2)
+	config.TimeoutSeconds = &timeout2
+	client2, err := cm.HookClient(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client1 == client2 {
+		t.Fatal("expected webhook configs with different timeouts to use different clients")
+	}
 }
 
 // fakeDynamicServiceResolver returns the next endpoint in the list for each request.
@@ -145,7 +225,8 @@ func TestWebhookClientHTTPConnectTimeout(t *testing.T) {
 		_, _ = w.Write([]byte("webhook response"))
 	})
 
-	timeout := 2 * time.Second
+	timeoutSeconds := int32(2)
+	timeout := time.Duration(timeoutSeconds) * time.Second
 	waitCh := make(chan struct{})
 	var wrapperProxyHandler httpHandlerWrapper = func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,8 +261,9 @@ func TestWebhookClientHTTPConnectTimeout(t *testing.T) {
 	))
 
 	client, err := cm.HookClient(ClientConfig{
-		Name:     "test-webhook",
-		CABundle: proxy.caBundle,
+		Name:           "test-webhook",
+		CABundle:       proxy.caBundle,
+		TimeoutSeconds: &timeoutSeconds,
 		Service: &ClientConfigService{
 			Name:      "webhook",
 			Namespace: "default",
@@ -193,16 +275,20 @@ func TestWebhookClientHTTPConnectTimeout(t *testing.T) {
 		t.Fatalf("failed to create webhook REST client: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), timeout)
-	_, err = client.Post().Body([]byte("{}")).DoRaw(ctx)
-	cancel()
+	_, err = client.Post().Body([]byte("{}")).DoRaw(context.Background())
 	if err == nil {
 		t.Fatalf("expected webhook request through HTTP CONNECT proxy to timeout, but it succeeded")
 	}
-	<-waitCh // wait for the proxy handler to finish
+	select {
+	case <-waitCh: // wait for the proxy handler to finish
+	case <-time.After(30 * time.Second):
+		t.Fatal("proxy handler should exit in time")
+	}
 }
 
 func TestWebhookClientHTTPConnect(t *testing.T) {
+	timeoutSeconds := int32(5)
+
 	var webhookCalls int32
 	var webhookHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&webhookCalls, 1)
@@ -236,8 +322,9 @@ func TestWebhookClientHTTPConnect(t *testing.T) {
 	))
 
 	client, err := cm.HookClient(ClientConfig{
-		Name:     "test-webhook",
-		CABundle: proxy.caBundle,
+		Name:           "test-webhook",
+		CABundle:       proxy.caBundle,
+		TimeoutSeconds: &timeoutSeconds,
 		Service: &ClientConfigService{
 			Name:      "webhook",
 			Namespace: "default",
@@ -251,9 +338,7 @@ func TestWebhookClientHTTPConnect(t *testing.T) {
 
 	n := 4
 	for i := range n {
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		_, err := client.Post().Body([]byte("{}")).DoRaw(ctx)
-		cancel()
+		_, err := client.Post().Body([]byte("{}")).DoRaw(context.Background())
 		if err != nil {
 			t.Fatalf("webhook request %d through HTTP CONNECT proxy failed: %v", i+1, err)
 		}
