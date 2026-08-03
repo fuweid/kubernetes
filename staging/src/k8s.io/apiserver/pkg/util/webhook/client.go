@@ -168,6 +168,10 @@ func (cm *ClientManager) hookClientConfig(cc ClientConfig) (*rest.Config, error)
 		))
 
 		if cc.TimeoutSeconds != nil {
+			// Explicitly set the timeout for the dialer because net/http removes the request
+			// timeout from the dial context. We cannot set cfg.Timeout because the dispatcher
+			// already handles the request timeout and the admission e2e test also relies on a
+			// context deadline error. cfg.Timeout changes it to an http.Client timeout error.
 			timeout := time.Duration(*cc.TimeoutSeconds) * time.Second
 			delegateDialer := dialerForConfig(cfg)
 			cfg.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {

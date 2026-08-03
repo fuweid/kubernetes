@@ -45,6 +45,9 @@ import (
 
 var directDialer utilnet.DialFunc = http.DefaultTransport.(*http.Transport).DialContext
 
+// defaultDialTimeout matches http.DefaultTransport dial timeout
+const defaultDialTimeout = 30 * time.Second
+
 func init() {
 	client.Metrics.RegisterMetrics(legacyregistry.Registerer())
 }
@@ -189,7 +192,7 @@ func (t *httpConnectProxier) proxy(ctx context.Context, addr string) (net.Conn, 
 		}
 
 		_ = t.conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT to %s: %w", addr, context.Cause(ctx))
+		return nil, fmt.Errorf("proxy CONNECT to %s failed: %w", addr, context.Cause(ctx))
 	}
 }
 
@@ -197,10 +200,27 @@ var _ proxier = &grpcProxier{}
 
 type grpcProxier struct {
 	tunnel client.Tunnel
+	cancel context.CancelCauseFunc
 }
 
 func (g *grpcProxier) proxy(ctx context.Context, addr string) (net.Conn, error) {
-	return g.tunnel.DialContext(ctx, "tcp", addr)
+	c, err := g.tunnel.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		g.cancel(err)
+		return nil, err
+	}
+	return &grpcConn{Conn: c, cancel: g.cancel}, nil
+}
+
+type grpcConn struct {
+	net.Conn
+	cancel context.CancelCauseFunc
+}
+
+func (g *grpcConn) Close() error {
+	err := g.Conn.Close()
+	g.cancel(err)
+	return err
 }
 
 type proxyServerConnector interface {
@@ -247,31 +267,27 @@ type udsGRPCConnector struct {
 }
 
 // connect establishes a connection to a proxy over gRPC.
-// TODO At the moment, it does not use the provided context.
-func (u *udsGRPCConnector) connect(_ context.Context) (proxier, error) {
+func (u *udsGRPCConnector) connect(connectCtx context.Context) (proxier, error) {
 	udsName := u.udsName
-	dialOption := grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+	dialOption := grpc.WithContextDialer(func(_ context.Context, addr string) (net.Conn, error) {
 		var d net.Dialer
-		c, err := d.DialContext(ctx, "unix", udsName)
+		c, err := d.DialContext(connectCtx, "unix", udsName)
 		if err != nil {
 			klog.Errorf("failed to create connection to uds name %s, error: %v", udsName, err)
 		}
 		return c, err
 	})
 
-	// CreateSingleUseGrpcTunnel() unfortunately couples dial and connection contexts. Because of that,
-	// we cannot use ctx just for dialing and control the connection lifetime separately.
-	// See https://github.com/kubernetes-sigs/apiserver-network-proxy/issues/357.
-	tunnelCtx := context.TODO()
-	tunnel, err := client.CreateSingleUseGrpcTunnel(tunnelCtx, udsName, dialOption,
+	tunnelCtx, cancel := context.WithCancelCause(context.Background())
+	tunnel, err := client.CreateSingleUseGrpcTunnelWithContext(connectCtx, tunnelCtx, udsName, dialOption,
 		grpc.WithBlock(),
 		grpc.WithReturnConnectionError(),
-		grpc.WithTimeout(30*time.Second), // matches http.DefaultTransport dial timeout
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
+		cancel(err)
 		return nil, err
 	}
-	return &grpcProxier{tunnel: tunnel}, nil
+	return &grpcProxier{tunnel: tunnel, cancel: cancel}, nil
 }
 
 type dialerCreator struct {
@@ -290,6 +306,14 @@ func (d *dialerCreator) createDialer() utilnet.DialFunc {
 		return directDialer
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			// Match the http default transport's dial timeout for
+			// callers without a deadline.
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, defaultDialTimeout)
+			defer cancel()
+		}
+
 		ctx, span := tracing.Start(ctx, fmt.Sprintf("Proxy via %s protocol over %s", d.options.protocol, d.options.transport), attribute.String("address", addr))
 		defer span.End(500 * time.Millisecond)
 		start := egressmetrics.Metrics.Clock().Now()
